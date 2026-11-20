@@ -29,6 +29,47 @@ describe('subagent store', () => {
     expect(item?.summary).toBe('done')
   })
 
+  it('shows a continued child on a new delegation and ignores delayed events from its previous run', () => {
+    const first = { subagent_id: 'child', delegation_id: 'd1', status: 'running' }
+    const resumed = { ...first, delegation_id: 'd2' }
+    upsertSubagent('owner', first, true, 'subagent.start')
+    upsertSubagent(
+      'owner',
+      { ...first, status: 'interrupted', summary: 'First run stopped', tool_count: 5 },
+      false,
+      'subagent.complete'
+    )
+
+    upsertSubagent('owner', resumed, true, 'subagent.start')
+    upsertSubagent('owner', { ...first, status: 'failed' }, false, 'subagent.complete')
+    upsertSubagent('owner', first, true, 'subagent.start')
+    reconcileSubagentSnapshot('owner', [first])
+
+    expect(listFor('owner')).toHaveLength(1)
+    expect(listFor('owner')[0]).toMatchObject({ id: 'child', delegationId: 'd2', status: 'running', stream: [] })
+    expect(listFor('owner')[0]?.summary).toBeUndefined()
+    expect(listFor('owner')[0]?.toolCount).toBeUndefined()
+
+    upsertSubagent('owner', { ...resumed, status: 'completed', summary: 'New result' }, false, 'subagent.complete')
+    expect(listFor('owner')[0]).toMatchObject({ status: 'completed', summary: 'New result' })
+  })
+
+  it('hydrates a continued child after pruning while keeping both prior runs retired', () => {
+    const first = { subagent_id: 'child', delegation_id: 'd1', status: 'running', started_at: 100 }
+    const resumed = { ...first, delegation_id: 'd2', started_at: 200 }
+    reconcileSubagentSnapshot('owner', [{ ...first, status: 'interrupted' }])
+    pruneFinishedSessionSubagents('owner')
+    reconcileSubagentSnapshot('owner', [first])
+    expect(listFor('owner')).toEqual([])
+
+    reconcileSubagentSnapshot('owner', [resumed])
+    expect(listFor('owner')).toMatchObject([{ id: 'child', delegationId: 'd2', status: 'running', startedAt: 200_000 }])
+    upsertSubagent('owner', { ...resumed, status: 'completed' }, false, 'subagent.complete')
+    pruneFinishedSessionSubagents('owner')
+    reconcileSubagentSnapshot('owner', [first, resumed])
+    expect(listFor('owner')).toEqual([])
+  })
+
   it('accepts a terminal subagent.complete for an interrupted session, and still drops live progress', () => {
     upsertSubagent('stopped', { goal: 'finishing', status: 'running', subagent_id: 'sa-1', task_index: 0 })
 

@@ -53,17 +53,20 @@ const TOOL_PREVIEW_MAX = 96
 
 export const $subagentsBySession = atom<Record<string, SubagentProgress[]>>({})
 
-// A turn prunes display rows, not child identities. Keep retired IDs with the
-// session's current list so late starts/rosters cannot recreate completed work.
+// A continued child keeps its ID but gets a new delegation. Keep retired runs
+// with the current list so late starts and rosters cannot recreate them.
 // Clearing the session (or resetting the store) releases this history too.
-const retiredSubagents = new WeakMap<SubagentProgress[], Set<string>>()
+const retiredSubagents = new WeakMap<SubagentProgress[], Map<string, Set<string>>>()
 
 function setSessionSubagents(sid: string, previous: SubagentProgress[], next: SubagentProgress[]) {
-  const retired = retiredSubagents.get(previous) ?? new Set<string>()
+  const retired = retiredSubagents.get(previous) ?? new Map<string, Set<string>>()
+  const nextDelegations = new Map(next.map(item => [item.id, item.delegationId]))
 
   for (const item of previous) {
-    if (TERMINAL.has(item.status)) {
-      retired.add(item.id)
+    if (TERMINAL.has(item.status) || isDifferentRun(item, nextDelegations.get(item.id))) {
+      const runs = retired.get(item.id) ?? new Set<string>()
+      runs.add(item.delegationId ?? '')
+      retired.set(item.id, runs)
     }
   }
 
@@ -86,6 +89,15 @@ const isStr = (v: unknown): v is string => typeof v === 'string'
 const str = (v: unknown) => (isStr(v) ? v : '')
 const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : undefined)
 const strList = (v: unknown) => (Array.isArray(v) ? v.filter(isStr) : [])
+
+const isDifferentRun = (previous: SubagentProgress | undefined, delegationId: string | undefined) =>
+  !!previous?.delegationId && !!delegationId && previous.delegationId !== delegationId
+
+function isRetiredRun(list: SubagentProgress[], id: string, delegationId: string | undefined) {
+  const runs = retiredSubagents.get(list)?.get(id)
+
+  return !!runs && (!delegationId || runs.has('') || runs.has(delegationId))
+}
 
 const asStatus = (v: unknown, terminalEvent = false): SubagentStatus => {
   if (v === 'completed' || v === 'failed' || v === 'interrupted') {
@@ -243,6 +255,33 @@ function toProgress(payload: SubagentPayload, prev: SubagentProgress | undefined
 
 const failedDelegationId = (p: SubagentPayload) => `delegation:${str(p.delegation_id)}:${num(p.task_index) ?? 0}`
 
+function projectSnapshotChild(
+  payload: SubagentPayload,
+  id: string,
+  prev: SubagentProgress | undefined,
+  previous: SubagentProgress[]
+) {
+  const delegationId = str(payload.delegation_id) || prev?.delegationId
+  const newRun = isDifferentRun(prev, delegationId)
+
+  if (isRetiredRun(previous, id, delegationId) || (prev && TERMINAL.has(prev.status) && !newRun)) {
+    return
+  }
+
+  const priorRun = newRun ? undefined : prev
+  const projected = toProgress(payload, priorRun)
+  projected.startedAt = (num(payload.started_at) ?? 0) * 1000 || priorRun?.startedAt || projected.startedAt
+  projected.updatedAt = priorRun?.updatedAt ?? projected.startedAt
+
+  // A roster records the last tool, not a currently executing call. Seed cold
+  // activity only; a repeated snapshot must not append over newer live text.
+  if (!projected.stream.length && str(payload.last_tool)) {
+    projected.stream = [{ at: projected.updatedAt, kind: 'tool', text: formatTool(str(payload.last_tool)) }]
+  }
+
+  return projected
+}
+
 /** Reconcile a scoped, race-checked snapshot without replacing stream history.
  *  `failedDelegations` are durable failed tasks the live roster no longer holds
  *  (ended, or a renderer reload dropped them): they land as terminal failed rows
@@ -260,25 +299,16 @@ export function reconcileSubagentSnapshot(
   for (const payload of children) {
     const id = str(payload.subagent_id)
 
-    if (!id || retiredSubagents.get(previous)?.has(id)) {
+    if (!id) {
       continue
     }
 
     const index = next.findIndex(item => item.id === id)
     const prev = next[index]
+    const projected = projectSnapshotChild(payload, id, prev, previous)
 
-    if (prev && TERMINAL.has(prev.status)) {
+    if (!projected) {
       continue
-    }
-
-    const projected = toProgress(payload, prev)
-    projected.startedAt = (num(payload.started_at) ?? 0) * 1000 || prev?.startedAt || projected.startedAt
-    projected.updatedAt = prev?.updatedAt ?? projected.startedAt
-
-    // A roster records the last tool, not a currently executing call. Seed cold
-    // activity only; a repeated snapshot must not append over newer live text.
-    if (!projected.stream.length && str(payload.last_tool)) {
-      projected.stream = [{ at: projected.updatedAt, kind: 'tool', text: formatTool(str(payload.last_tool)) }]
     }
 
     if (index < 0) {
@@ -295,7 +325,7 @@ export function reconcileSubagentSnapshot(
 
     if (
       !delegationId ||
-      retiredSubagents.get(previous)?.has(id) ||
+      isRetiredRun(previous, id, delegationId) ||
       next.some(item => item.id === id || (item.delegationId === delegationId && item.taskIndex === taskIndex))
     ) {
       continue
@@ -381,17 +411,19 @@ export function upsertSubagent(sid: string, payload: SubagentPayload, createIfMi
   const id = idOf(payload)
   const idx = list.findIndex(item => item.id === id)
 
-  if (retiredSubagents.get(list)?.has(id) || (idx < 0 && !createIfMissing)) {
-    return
-  }
-
   const prev = idx >= 0 ? list[idx] : undefined
+  const delegationId = str(payload.delegation_id) || prev?.delegationId
+  const newRun = isDifferentRun(prev, delegationId)
 
-  if (prev && TERMINAL.has(prev.status)) {
+  if (
+    isRetiredRun(list, id, delegationId) ||
+    (!createIfMissing && (!prev || newRun)) ||
+    (prev && TERMINAL.has(prev.status) && !newRun)
+  ) {
     return
   }
 
-  const next = toProgress(payload, prev, eventType)
+  const next = toProgress(payload, newRun ? undefined : prev, eventType)
   const nextList = idx >= 0 ? list.map(item => (item.id === id ? next : item)) : [...list, next]
 
   setSessionSubagents(sid, list, nextList)
