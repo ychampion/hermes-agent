@@ -251,7 +251,7 @@ def test_exact_old_active_turn_recovers_even_when_updated_at_is_stale(tmp_path):
     assert recovered.resume_pending is True
     assert recovered.resume_reason == "restart_interrupted"
     assert recovered.last_resume_marked_at is not None
-    assert recovered.last_resume_marked_at > datetime.now() - timedelta(seconds=5)
+    assert recovered.last_resume_marked_at.timestamp() > time.time() - 5
     assert recovered.active_turn_token is None
     assert recovered.active_turn_started_at is None
     assert token

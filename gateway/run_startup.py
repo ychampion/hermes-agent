@@ -632,8 +632,7 @@ class GatewayStartupMixin:
             from gateway.session_authorities import all_authorities, holds_admission
             if any(holds_admission(authority, entry.session_id) for authority in all_authorities(self)):
                 continue
-            # Epoch math: the marker was stamped naive-local by the previous process, possibly
-            # on the other side of a DST change; wall-clock subtraction is off by the shift.
+            # Use epoch arithmetic for both UTC markers and legacy local-time entries.
             marker = entry.last_resume_marked_at or entry.updated_at
             if not _is_fresh_gateway_interruption(marker, window_secs=window):
                 continue

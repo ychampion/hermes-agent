@@ -716,6 +716,59 @@ async def test_startup_auto_resume_freshness_survives_spring_forward(monkeypatch
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(not hasattr(time, "tzset"), reason="needs a POSIX process timezone switch")
+@pytest.mark.parametrize("fold", [0, 1], ids=["first-hour", "repeated-hour"])
+@pytest.mark.parametrize("interruption", ["watchdog", "orphaned-turn"])
+async def test_persisted_restart_marker_stays_fresh_during_fall_back(tmp_path, monkeypatch, fold, interruption):
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="repeated-hour")
+    adapter.handle_message = AsyncMock()
+    original_tz = os.environ.get("TZ")
+    try:
+        os.environ["TZ"] = "America/New_York"
+        time.tzset()
+        marked_epoch = datetime(2026, 11, 1, 1, 30, fold=fold).timestamp()
+        current_epoch = marked_epoch
+
+        class FrozenDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return datetime.fromtimestamp(current_epoch, tz)
+
+        monkeypatch.setattr("gateway.session_lifecycle.datetime", FrozenDatetime)
+        monkeypatch.setattr(time, "time", lambda: current_epoch)
+        monkeypatch.setenv("HERMES_AUTO_CONTINUE_FRESHNESS", "3600")
+        sessions_dir = tmp_path / "sessions"
+        store = SessionStore(sessions_dir, runner.config)
+        try:
+            entry = store.get_or_create_session(source)
+            if interruption == "watchdog":
+                assert store.mark_resume_pending(entry.session_key)
+            else:
+                assert store.mark_turn_active(entry.session_key)
+                assert store.recover_interrupted_turns() == 1
+        finally:
+            store.close_all_db_handles()
+
+        current_epoch += 60
+        runner.session_store = SessionStore(sessions_dir, runner.config)
+        try:
+            assert runner._schedule_resume_pending_sessions() == 1
+            await asyncio.gather(*runner._background_tasks)
+            adapter.handle_message.assert_awaited_once()
+            restored = runner.session_store.get_or_create_session(source)
+            assert restored.last_resume_marked_at.timestamp() == marked_epoch
+        finally:
+            runner.session_store.close_all_db_handles()
+    finally:
+        if original_tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = original_tz
+        time.tzset()
+
+
+@pytest.mark.asyncio
 async def test_served_profile_reconnect_resumes_what_boot_deferred():
     """A served profile's session whose own bot is offline at boot is deferred (never answered from the
     default bot) "for the reconnect watcher" -- which must then resume it through that profile's bot."""

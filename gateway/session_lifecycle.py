@@ -232,7 +232,8 @@ class SessionLifecycleMixin:
         """Promote crash-left turn markers into ``resume_pending`` (unclean startup only).
         Old/invalid markers are cleared without resuming; suspended sessions are never re-armed.
         Returns the number of newly promoted sessions."""
-        now, epoch_now = _now(), time.time()
+        epoch_now = time.time()
+        now = datetime.fromtimestamp(epoch_now, UTC)
         promoted = 0
 
         def _promote(entry: SessionEntry) -> bool:
@@ -279,7 +280,7 @@ class SessionLifecycleMixin:
                 return False
             entry.resume_pending = True
             entry.resume_reason = reason
-            entry.last_resume_marked_at = _now()
+            entry.last_resume_marked_at = datetime.now(UTC)
         return self._update_entry(session_key, _apply)
 
     def clear_resume_pending(self, session_key: str) -> bool:
